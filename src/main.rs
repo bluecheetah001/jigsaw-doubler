@@ -1,479 +1,221 @@
+use std::collections::HashMap;
 use std::fmt::Debug;
 
+mod puzzle;
 mod sat;
+use itertools::Itertools;
+use puzzle::*;
 use sat::*;
+use varisat::Lit;
 
 fn main() {
-    let config = Config::new(5, 5, 2);
-    JigsawDoubler::run(config);
+    let puzzle = SquarePuzzle::new(5, 5);
+    JigsawDoubler::run(puzzle);
     println!("Hello, world!");
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PieceKind {
-    Center,
-    Edge,
-    Corner,
+struct EdgeMatchingVars {
+    orbit: EdgeOrbitInfo,
+    // lower-triangular matrix (c < r)
+    // index(r,c) = r*(r-1)/2 + c
+    // var is true if edge c and edge r have the same shape
+    matches: Vec<Lit>,
+}
+impl EdgeMatchingVars {
+    fn new(orbit: EdgeOrbitInfo, sat: &mut SatProblem) -> Self {
+        let len = orbit.len * (orbit.len - 1) / 2;
+        let matches = (0..len).map(|_| sat.var()).collect_vec();
+        Self { orbit, matches }
+    }
+    fn matches(&self, a: usize, b: usize) -> Lit {
+        assert!(a < self.orbit.len);
+        assert!(b < self.orbit.len);
+        assert!(a != b);
+        let c = a.min(b);
+        let r = a.max(b);
+        self.matches[r * (r - 1) / 2 + c]
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PieceLocation {
-    UL,
-    UC,
-    UR,
-    CL,
-    CC,
-    CR,
-    DL,
-    DC,
-    DR,
+struct PieceDestVars {
+    orbit: PieceOrbitInfo,
+    // square matrix
+    // index(s,d) = s*len+d
+    // var is true if piece s ends up at piece d
+    dest: Vec<Lit>,
+    // rectangular matrix
+    // index(s,r) = s*len+r
+    // var is true if piece s ends up with rotation r
+    rot: Vec<Lit>,
+}
+impl PieceDestVars {
+    fn new(orbit: PieceOrbitInfo, sat: &mut SatProblem) -> Self {
+        let dest_len = orbit.len * orbit.len;
+        let dest = (0..dest_len).map(|_| sat.var()).collect_vec();
+        let rot_len = orbit.len * orbit.rotations;
+        let rot = (0..rot_len).map(|_| sat.var()).collect_vec();
+        Self { orbit, dest, rot }
+    }
+    fn dest(&self, s: usize, d: usize) -> Lit {
+        assert!(s < self.orbit.len);
+        assert!(d < self.orbit.len);
+        self.dest[s * self.orbit.len + d]
+    }
+    fn rot(&self, s: usize, r: usize) -> Lit {
+        assert!(s < self.orbit.len);
+        assert!(r < self.orbit.rotations);
+        self.rot[s * self.orbit.len + r]
+    }
 }
 
-struct Config {
-    rows: usize,
-    cols: usize,
-    edge_dups: usize,
-
-    num_edges: usize,
-    num_edge_ids: usize,
-    num_pieces: usize,
+struct PieceDestAdjacentVars {
+    map: HashMap<(PieceKeyEdge, PieceKeyEdge), Lit>,
 }
-impl Config {
-    fn new(rows: usize, cols: usize, edge_dups: usize) -> Self {
-        // allowing rows or cols to equal 1 creates edge pieces that are able to rotate.
-        // a lot of code is assuming edges can't rotate
-        assert!(rows >= 2);
-        assert!(cols >= 2);
-        // edge dups < 2 trivially can't produce a puzzle with multiple solutions
-        assert!(edge_dups >= 2);
-
-        let num_edges = rows * (cols - 1) + (rows - 1) * cols;
-        // loosening this to allow some edge ids to be duplicated an extra time should only affect JigsawDoubler::add_edge_duplicate_ids
-        // (and make sure that num_edge_ids is computed properly)
-        assert!(num_edges % edge_dups == 0);
-        let num_edge_ids = num_edges / edge_dups;
-
-        let num_pieces = rows * cols;
-
+impl PieceDestAdjacentVars {
+    fn new() -> Self {
         Self {
-            rows,
-            cols,
-            edge_dups,
-            num_edges,
-            num_edge_ids,
-            num_pieces,
+            map: HashMap::new(),
         }
     }
-    fn piece_kind(&self, p: usize) -> PieceKind {
-        let c = p % self.cols;
-        let r = p / self.cols;
-        let c_edge = c == 0 || c == self.cols - 1;
-        let r_edge = r == 0 || r == self.rows - 1;
-        if c_edge && r_edge {
-            PieceKind::Corner
-        } else if c_edge || r_edge {
-            PieceKind::Edge
-        } else {
-            PieceKind::Center
-        }
+    fn put(&mut self, a: PieceKeyEdge, b: PieceKeyEdge, var: Lit) {
+        assert!(a < b);
+        let key = (a, b);
+        assert!(!self.map.contains_key(&key));
+        self.map.insert(key, var);
     }
-    fn piece_location(&self, p: usize) -> PieceLocation {
-        let c = p % self.cols;
-        let r = p / self.cols;
-        match (c == 0, c == self.cols - 1, r == 0, r == self.rows - 1) {
-            (false, false, false, false) => PieceLocation::CC,
-            (true, false, false, false) => PieceLocation::CL,
-            (false, true, false, false) => PieceLocation::CR,
-            (false, false, true, false) => PieceLocation::UC,
-            (true, false, true, false) => PieceLocation::UL,
-            (false, true, true, false) => PieceLocation::UR,
-            (false, false, false, true) => PieceLocation::DC,
-            (true, false, false, true) => PieceLocation::DL,
-            (false, true, false, true) => PieceLocation::DR,
-            _ => unreachable!(),
-        }
+    // return isn't Option as I expect that callers will naturally not call with arguments that can't be adjacent
+    fn get(&mut self, a: PieceKeyEdge, b: PieceKeyEdge) -> Lit {
+        let key = (a.min(b), a.max(b));
+        *self.map.get(&key).unwrap()
     }
-    // get edge index of side of piece index
-    fn piece_edge(&self, mut p: usize, side: usize) -> usize {
-        // center piece sides are u, r, d, l
-        // edge and corner piece sides are clockwise from puzzle edge
-        // piece index is row major
-        // edge index is row major for vertical then row major for horizontal
-        let d_side = match self.piece_location(p) {
-            PieceLocation::UL => 1,
-            PieceLocation::UC => 1,
-            PieceLocation::UR => 2,
-            PieceLocation::CL => 0,
-            PieceLocation::CC => 0,
-            PieceLocation::CR => 2,
-            PieceLocation::DL => 0,
-            PieceLocation::DC => 3,
-            PieceLocation::DR => 3,
-        };
-        let side = (side + d_side) % 4;
-        if side == 0 {
-            p -= self.cols;
-        }
-        if side == 3 {
-            p -= 1
-        }
-        let c = p % self.cols;
-        let r = p / self.cols;
+}
 
-        // vertical
-        if side & 1 == 1 {
-            r * (self.cols - 1) + c
-        } else {
-            let vertical_edges = (self.cols - 1) * self.rows;
-            vertical_edges + r * self.cols + c
-        }
-    }
-    // get neighbor piece index of side of piece index
-    fn piece_neighbor(&self, p: usize, side: usize) -> usize {
-        let d_side = match self.piece_location(p) {
-            PieceLocation::UL => 1,
-            PieceLocation::UC => 1,
-            PieceLocation::UR => 2,
-            PieceLocation::CL => 0,
-            PieceLocation::CC => 0,
-            PieceLocation::CR => 2,
-            PieceLocation::DL => 0,
-            PieceLocation::DC => 3,
-            PieceLocation::DR => 3,
-        };
-        match (side + d_side) % 4 {
-            0 => p - self.cols,
-            1 => p + 1,
-            2 => p + self.cols,
-            3 => p - 1,
-            _ => unreachable!(),
-        }
-    }
-    // get the implicit rotation from moving src piece to dst piece
-    fn implicit_rotation(&self, src: usize, dst: usize) -> usize {
-        // TODO cleanup duplication
-        //      probably through introduction of Piece, Edge, Rotation, and RotatedPiece structs
-        let src_rot = match self.piece_location(src) {
-            PieceLocation::UL => 0,
-            PieceLocation::UC => 0,
-            PieceLocation::UR => 1,
-            PieceLocation::CR => 1,
-            PieceLocation::DR => 2,
-            PieceLocation::DC => 2,
-            PieceLocation::DL => 3,
-            PieceLocation::CL => 3,
-            PieceLocation::CC => 0,
-        };
-        let dst_rot = match self.piece_location(dst) {
-            PieceLocation::UL => 0,
-            PieceLocation::UC => 0,
-            PieceLocation::UR => 1,
-            PieceLocation::CR => 1,
-            PieceLocation::DR => 2,
-            PieceLocation::DC => 2,
-            PieceLocation::DL => 3,
-            PieceLocation::CL => 3,
-            PieceLocation::CC => 0,
-        };
-        dst_rot - src_rot
-    }
+struct JigsawDoubler<P> {
+    puzzle: P,
+    sat: SatProblem,
+    edge_matching_per_orbit: Vec<EdgeMatchingVars>,
+    piece_dest_per_orbit: Vec<PieceDestVars>,
+    piece_dest_is_adjacent: PieceDestAdjacentVars,
 }
-struct SingleEdgeVars {
-    id: Vec<Lit>,
-    dst_id: Vec<Lit>,
-}
-struct SinglePieceVars {
-    dst: Vec<Lit>,
-    rot: Option<[Lit; 4]>,
-}
-struct JigsawDoubler {
-    config: Config,
-    problem: Problem,
-    edge_vars: Vec<SingleEdgeVars>,
-    piece_vars: Vec<SinglePieceVars>,
-}
-impl JigsawDoubler {
-    pub fn run(config: Config) {
-        let mut s = Self::new(config);
+impl<P: Puzzle> JigsawDoubler<P> {
+    pub fn run(puzzle: P) {
+        let mut s = Self::new(puzzle);
         s.add_edge_vars();
         s.add_piece_vars();
-        s.add_edge_one_hot_id();
-        s.add_edge_duplicate_ids();
+        s.add_edge_one_hot_matching();
         s.add_piece_one_hot_dst();
         s.add_piece_one_hot_rot();
-        s.add_piece_no_duplicate_dst();
-        s.add_dst_valid();
-        s.add_dst_changed();
+        s.add_piece_one_hot_src();
+        s.add_piece_dst_adjacent_vars();
+        s.add_piece_dst_adjacent_not_same();
+        s.add_piece_dst_adjacent_to_matching();
 
         // TODO run problem
 
         // TODO extract result
     }
-    fn new(config: Config) -> Self {
-        let problem = Problem::new();
-        let edge_vars = vec![];
-        let piece_vars = vec![];
+    fn new(puzzle: P) -> Self {
         Self {
-            config,
-            problem,
-            edge_vars,
-            piece_vars,
+            puzzle,
+            sat: SatProblem::new(),
+            edge_matching_per_orbit: vec![],
+            piece_dest_per_orbit: vec![],
+            piece_dest_is_adjacent: PieceDestAdjacentVars::new(),
         }
     }
     fn add_edge_vars(&mut self) {
-        self.edge_vars = (0..self.config.num_edges)
-            .into_iter()
-            .map(|edge| Self::new_single_edge_vars(&self.config, &mut self.problem, edge))
-            .collect();
-    }
-    fn new_single_edge_vars(
-        config: &Config,
-        problem: &mut Problem,
-        edge_index: usize,
-    ) -> SingleEdgeVars {
-        let id = (0..config.num_edge_ids)
-            .into_iter()
-            .map(|edge_id| {
-                // to help break symetries, don't allow edge to have an id greater than its index
-                if edge_id <= edge_index {
-                    if edge_index == 0 {
-                        Lit::TRUE
-                    } else {
-                        problem.var()
-                    }
-                } else {
-                    Lit::FALSE
-                }
-            })
-            .collect();
-        let dst_id = (0..config.num_edge_ids)
-            .into_iter()
-            .map(|_| problem.var())
-            .collect();
-        SingleEdgeVars { id, dst_id }
+        self.edge_matching_per_orbit = (0..self.puzzle.num_edge_orbits())
+            .map(|i| self.puzzle.edge_orbit(i))
+            .map(|o| EdgeMatchingVars::new(o, &mut self.sat))
+            .collect_vec();
     }
     fn add_piece_vars(&mut self) {
-        self.piece_vars = (0..self.config.num_pieces)
-            .into_iter()
-            .map(|piece| Self::new_single_piece_vars(&self.config, &mut self.problem, piece))
-            .collect();
-    }
-    fn new_single_piece_vars(
-        config: &Config,
-        problem: &mut Problem,
-        src: usize,
-    ) -> SinglePieceVars {
-        let src_k = config.piece_kind(src);
-        let dst = (0..config.num_pieces)
-            .into_iter()
-            .map(|dst| {
-                let dst_k = config.piece_kind(dst);
-
-                // force piece 0,0 to not move
-                if src == 0 {
-                    return if dst == 0 { Lit::TRUE } else { Lit::FALSE };
-                }
-                if dst == 0 {
-                    return Lit::FALSE;
-                }
-
-                // piece kind must agree
-                if src_k == dst_k {
-                    problem.var()
-                } else {
-                    Lit::FALSE
-                }
-            })
-            .collect();
-        let rot = if src_k == PieceKind::Center {
-            Some([problem.var(), problem.var(), problem.var(), problem.var()])
-        } else {
-            None
-        };
-        SinglePieceVars { dst, rot }
+        self.piece_dest_per_orbit = (0..self.puzzle.num_piece_orbits())
+            .map(|i| self.puzzle.piece_orbit(i))
+            .map(|o| PieceDestVars::new(o, &mut self.sat))
+            .collect_vec();
     }
 
-    fn add_edge_one_hot_id(&mut self) {
-        for e in self.edge_vars.iter() {
-            let count = self.problem.count_up_to(2, &e.id);
-            self.problem.clause(vec![count[1]]);
-            self.problem.clause(vec![!count[2]]);
-        }
-    }
-    fn add_edge_duplicate_ids(&mut self) {
-        for id in 0..self.config.num_edge_ids {
-            let vars = self.edge_vars.iter().map(|e| e.id[id]).collect::<Vec<_>>();
-            let count = self.problem.count_up_to(self.config.edge_dups + 1, &vars);
-            self.problem.clause(vec![count[self.config.edge_dups]]);
-            self.problem.clause(vec![!count[self.config.edge_dups + 1]]);
+    fn add_edge_one_hot_matching(&mut self) {
+        for info in self.edge_matching_per_orbit.iter() {
+            for a in 0..info.orbit.len {
+                let a_matches = (0..info.orbit.len)
+                    .filter(|b| *b != a)
+                    .map(|b| info.matches(a, b))
+                    .collect_vec();
+                self.sat.exact_count_clause(1, &a_matches);
+            }
         }
     }
     fn add_piece_one_hot_dst(&mut self) {
-        for p in self.piece_vars.iter() {
-            let count = self.problem.count_up_to(2, &p.dst);
-            self.problem.clause(vec![count[1]]);
-            self.problem.clause(vec![!count[2]]);
+        for info in self.piece_dest_per_orbit.iter() {
+            for s in 0..info.orbit.len {
+                let s_dst = (0..info.orbit.len).map(|d| info.dest(s, d)).collect_vec();
+                self.sat.exact_count_clause(1, &s_dst);
+            }
         }
     }
     fn add_piece_one_hot_rot(&mut self) {
-        for p in self.piece_vars.iter() {
-            if let Some(rot) = &p.rot {
-                let count = self.problem.count_up_to(2, rot);
-                self.problem.clause(vec![count[1]]);
-                self.problem.clause(vec![!count[2]]);
+        for info in self.piece_dest_per_orbit.iter() {
+            for s in 0..info.orbit.len {
+                let s_rot = (0..info.orbit.rotations)
+                    .map(|r| info.rot(s, r))
+                    .collect_vec();
+                self.sat.exact_count_clause(1, &s_rot);
             }
         }
     }
-    fn add_piece_no_duplicate_dst(&mut self) {
-        for dst in 0..self.config.num_pieces {
-            let vars = self
-                .piece_vars
-                .iter()
-                .map(|p| p.dst[dst])
-                .collect::<Vec<_>>();
-            let count = self.problem.count_up_to(2, &vars);
-            self.problem.clause(vec![count[1]]);
-            self.problem.clause(vec![!count[2]]);
-        }
-    }
-
-    fn add_dst_valid(&mut self) {
-        for (src, src_vars) in self.piece_vars.iter().enumerate() {
-            for (dst, dst_var) in src_vars.dst.iter().enumerate() {
-                if dst_var.is_false() {
-                    continue;
-                }
-                match self.config.piece_kind(src) {
-                    PieceKind::Center => {
-                        for (j, rot_var) in src_vars.rot.unwrap().iter().enumerate() {
-                            for i in 0..4 {
-                                Self::add_implies_move_edge(
-                                    &mut self.problem,
-                                    &self.edge_vars,
-                                    *dst_var,
-                                    *rot_var,
-                                    self.config.piece_edge(src, i),
-                                    self.config.piece_edge(dst, (i + j) % 4),
-                                )
-                            }
-                        }
-                    }
-                    PieceKind::Edge => {
-                        for i in 0..3 {
-                            Self::add_implies_move_edge(
-                                &mut self.problem,
-                                &self.edge_vars,
-                                *dst_var,
-                                Lit::TRUE,
-                                self.config.piece_edge(src, i),
-                                self.config.piece_edge(dst, i),
-                            )
-                        }
-                    }
-                    PieceKind::Corner => {
-                        for i in 0..2 {
-                            Self::add_implies_move_edge(
-                                &mut self.problem,
-                                &self.edge_vars,
-                                *dst_var,
-                                Lit::TRUE,
-                                self.config.piece_edge(src, i),
-                                self.config.piece_edge(dst, i),
-                            )
-                        }
-                    }
-                }
+    fn add_piece_one_hot_src(&mut self) {
+        for info in self.piece_dest_per_orbit.iter() {
+            for d in 0..info.orbit.len {
+                let d_src = (0..info.orbit.len).map(|s| info.dest(s, d)).collect_vec();
+                self.sat.exact_count_clause(1, &d_src);
             }
         }
     }
-    fn add_implies_move_edge(
-        problem: &mut Problem,
-        edge_vars: &[SingleEdgeVars],
-        piece_dst: Lit,
-        piece_rot: Lit,
-        src_e: usize,
-        dst_e: usize,
-    ) {
-        let src_e = &*edge_vars[src_e].id;
-        let dst_e = &*edge_vars[dst_e].dst_id;
-        for (src_e, dst_e) in std::iter::zip(src_e, dst_e) {
-            // piece_dst & piece_rot => (src_e == dst_e)
-            problem.clause(vec![!piece_dst, !piece_rot, !*src_e, *dst_e]);
-            problem.clause(vec![!piece_dst, !piece_rot, *src_e, !*dst_e]);
-        }
+
+    fn add_piece_dst_adjacent_vars(&mut self) {
+        todo!()
+        // loop over piece-a-edge, piece-b-edge
+        //   dst-adjacent = and(piece-a-edge-dst == dst-edge-parity && piece-b-edge-dst == dst-edge-parity for each dst-edge-parity)
     }
 
-    fn add_dst_changed(&mut self) {
-        for (src, src_vars) in self.piece_vars.iter().enumerate() {
-            for (dst, dst_var) in src_vars.dst.iter().enumerate() {
-                if dst_var.is_false() {
-                    continue;
-                }
-                match self.config.piece_kind(src) {
-                    PieceKind::Center => {
-                        for (j, rot_var) in src_vars.rot.unwrap().iter().enumerate() {
-                            for i in 0..4 {
-                                Self::add_dst_not_adjacent(
-                                    &mut self.problem,
-                                    &self.piece_vars,
-                                    *dst_var,
-                                    *rot_var,
-                                    self.config.piece_neighbor(src, i),
-                                    self.config.piece_neighbor(dst, (i + j) % 4),
-                                    j,
-                                )
-                            }
-                        }
-                    }
-                    PieceKind::Edge => {
-                        for i in 0..3 {
-                            Self::add_dst_not_adjacent(
-                                &mut self.problem,
-                                &self.piece_vars,
-                                *dst_var,
-                                Lit::TRUE,
-                                self.config.piece_neighbor(src, i),
-                                self.config.piece_neighbor(dst, i),
-                                self.config.implicit_rotation(src, dst),
-                            )
-                        }
-                    }
-                    PieceKind::Corner => {
-                        for i in 0..2 {
-                            Self::add_dst_not_adjacent(
-                                &mut self.problem,
-                                &self.piece_vars,
-                                *dst_var,
-                                Lit::TRUE,
-                                self.config.piece_neighbor(src, i),
-                                self.config.piece_neighbor(dst, i),
-                                self.config.implicit_rotation(src, dst),
-                            )
-                        }
-                    }
-                }
+    fn add_piece_dst_adjacent_not_same(&mut self) {
+        for (edge_orbit, edge_info) in self.edge_matching_per_orbit.iter().enumerate() {
+            for edge_a in 0..edge_info.orbit.len {
+                let [piece_a_1, piece_a_2] =
+                    self.puzzle.edge_pieces(EdgeKey::new(edge_orbit, edge_a));
+                // destination pieces must change neighbors
+                self.sat
+                    .not_clause(self.piece_dest_is_adjacent.get(piece_a_1, piece_a_2));
             }
         }
     }
-    fn add_dst_not_adjacent(
-        problem: &mut Problem,
-        piece_vars: &[SinglePieceVars],
-        piece_dst: Lit,
-        piece_rot: Lit,
-        neighbor: usize,
-        neighbor_dst: usize,
-        neighbor_rot: usize,
-    ) {
-        let neighbor_vars = &piece_vars[neighbor];
-        let neighbor_dst = neighbor_vars.dst[neighbor_dst];
-        let neighbor_rot = neighbor_vars
-            .rot
-            .map(|r| r[neighbor_rot])
-            // if a neighbor is implicitly rotated, then it either can't go to the destination or will have the correct rotation
-            .unwrap_or(Lit::TRUE);
 
-        // TODO pretty sure this clause is emitted twice due to it's symetry
-        // piece_dst & piece_rot => !neighbor_dst | !neighbor_rot
-        problem.clause(vec![!piece_dst, !piece_rot, !neighbor_dst, !neighbor_rot]);
+    fn add_piece_dst_adjacent_to_matching(&mut self) {
+        for (edge_orbit, edge_info) in self.edge_matching_per_orbit.iter().enumerate() {
+            for edge_a in 0..edge_info.orbit.len {
+                let [piece_a_1, piece_a_2] =
+                    self.puzzle.edge_pieces(EdgeKey::new(edge_orbit, edge_a));
+
+                for edge_b in 0..edge_a {
+                    let [piece_b_1, piece_b_2] =
+                        self.puzzle.edge_pieces(EdgeKey::new(edge_orbit, edge_b));
+
+                    // edges match implies destination pieces trade neighbors
+                    let case_1 = self.sat.and_var(&[
+                        self.piece_dest_is_adjacent.get(piece_a_1, piece_b_1),
+                        self.piece_dest_is_adjacent.get(piece_a_2, piece_b_2),
+                    ]);
+                    let case_2 = self.sat.and_var(&[
+                        self.piece_dest_is_adjacent.get(piece_a_1, piece_b_2),
+                        self.piece_dest_is_adjacent.get(piece_a_2, piece_b_1),
+                    ]);
+                    let dest_matches = self.sat.or_var(&[case_1, case_2]);
+                    self.sat
+                        .implies_clause(edge_info.matches(edge_a, edge_b), dest_matches);
+                }
+            }
+        }
     }
 }

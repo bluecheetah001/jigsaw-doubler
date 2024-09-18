@@ -1,195 +1,140 @@
+use itertools::Itertools;
 use varisat::cnf::CnfFormula;
-use varisat::lit::LitIdx;
-
-use std::io::Write;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Lit(LitIdx);
-impl Lit {
-    const SIGN_BIT: LitIdx = 1;
-    const MAX_ID: usize = LitIdx::MAX as usize >> 1;
-    pub const TRUE: Self = Self(0);
-    pub const FALSE: Self = Self(Self::SIGN_BIT);
-
-    pub fn new(id: usize) -> Self {
-        assert!(
-            id <= Self::MAX_ID && id >= 1,
-            "{} must be within [1,{}]",
-            id,
-            Self::MAX_ID
-        );
-        Self((id as LitIdx) << 1)
-    }
-
-    pub fn is_const(&self) -> bool {
-        (self.0 & !Self::SIGN_BIT) == 0
-    }
-    pub fn is_true(&self) -> bool {
-        *self == Self::TRUE
-    }
-    pub fn is_false(&self) -> bool {
-        *self == Self::FALSE
-    }
-
-    // between 1 and Self::MAX_ID
-    pub fn id(&self) -> usize {
-        assert!(!self.is_const());
-        (self.0 >> 1) as usize
-    }
-    pub fn is_positive(&self) -> bool {
-        self.0 & Self::SIGN_BIT == 0
-    }
-    pub fn is_negative(&self) -> bool {
-        !self.is_positive()
-    }
-}
-impl std::ops::Not for Lit {
-    type Output = Self;
-
-    fn not(self) -> Self::Output {
-        Self(self.0 ^ Self::SIGN_BIT)
-    }
-}
+use varisat::{ExtendFormula, Lit};
 
 #[derive(Debug)]
-pub struct Problem {
-    num_variables: usize,
-    clauses: Vec<Box<[Lit]>>,
+pub struct SatProblem {
+    cnf: CnfFormula,
 }
-impl Problem {
+impl SatProblem {
     pub fn new() -> Self {
         Self {
-            num_variables: 0,
-            clauses: vec![],
+            cnf: CnfFormula::new(),
         }
     }
     /// allocate a new var
     pub fn var(&mut self) -> Lit {
-        assert!(self.num_variables < Lit::MAX_ID);
-        self.num_variables += 1;
-        Lit::new(self.num_variables)
+        self.cnf.new_var().positive()
     }
     /// add a new CNF clause
-    pub fn clause(&mut self, mut vars: Vec<Lit>) {
-        if !vars.contains(&Lit::TRUE) {
-            vars.retain(|v| *v != Lit::FALSE);
-            if vars.is_empty() {
-                panic!("added rule that can never be true")
-            }
-            for v in vars.iter() {
-                if v.id() > self.num_variables {
-                    panic!("rule contains variable out of bounds")
-                }
-            }
-            self.clauses.push(vars.into_boxed_slice())
+    pub fn or_clause(&mut self, vars: &[Lit]) {
+        self.cnf.add_clause(vars);
+    }
+    pub fn nor_clause(&mut self, vars: &[Lit]) {
+        let vars = vars.iter().map(|v| !*v).collect_vec();
+        self.and_clause(&vars);
+    }
+    pub fn and_clause(&mut self, vars: &[Lit]) {
+        for v in vars {
+            self.or_clause(&[*v])
         }
+    }
+    pub fn nand_clause(&mut self, vars: &[Lit]) {
+        let vars = vars.iter().map(|v| !*v).collect_vec();
+        self.or_clause(&vars);
+    }
+    pub fn not_clause(&mut self, var: Lit) {
+        self.or_clause(&[!var])
+    }
+    pub fn implies_clause(&mut self, a: Lit, b: Lit) {
+        self.or_clause(&[!a, b])
+    }
+    pub fn and_implies_clause(&mut self, a: &[Lit], b: Lit) {
+        let vars = a
+            .iter()
+            .map(|v| !*v)
+            .chain(std::iter::once(b))
+            .collect_vec();
+        self.or_clause(&vars)
+    }
+    pub fn implies_or_clause(&mut self, a: Lit, b: &[Lit]) {
+        let vars = std::iter::once(a).chain(b.iter().copied()).collect_vec();
+        self.or_clause(&vars)
+    }
+    pub fn exact_count_clause(&mut self, count: usize, vars: &[Lit]) {
+        // short-circuit / optimize a few obvious edge cases
+        if count == 0 {
+            self.nor_clause(vars);
+        }
+        if count == vars.len() {
+            self.and_clause(vars);
+        }
+        if count > vars.len() {
+            panic!("not satisfiable")
+        }
+        let count_greater_than = self.count_up_to_vars(count + 1, vars);
+        self.and_clause(&[count_greater_than[count - 1], !count_greater_than[count]]);
     }
 
     // tseytin transform
-    pub fn and_var(&mut self, mut vars: Vec<Lit>) -> Lit {
-        if vars.contains(&Lit::FALSE) {
-            return Lit::FALSE;
-        }
-        vars.retain(|v| *v != Lit::TRUE);
-        if vars.is_empty() {
-            return Lit::TRUE;
-        }
-        if let [v] = *vars {
-            return v;
-        }
-
+    pub fn and_var(&mut self, vars: &[Lit]) -> Lit {
         let result = self.var();
 
         // result => v
         for v in vars.iter() {
-            self.clause(vec![!result, *v]);
+            self.implies_clause(result, *v);
         }
         // and(vars) => result
-        self.clause(
-            vars.into_iter()
-                .map(|v| !v)
-                .chain(std::iter::once(result))
-                .collect(),
-        );
+        self.and_implies_clause(vars, result);
 
         result
     }
-    pub fn or_var(&mut self, mut vars: Vec<Lit>) -> Lit {
-        if vars.contains(&Lit::TRUE) {
-            return Lit::TRUE;
-        }
-        vars.retain(|v| *v != Lit::FALSE);
-        if vars.is_empty() {
-            return Lit::FALSE;
-        }
-        if let [v] = *vars {
-            return v;
-        }
-
+    pub fn or_var(&mut self, vars: &[Lit]) -> Lit {
         let result = self.var();
 
         // v => result
         for v in vars.iter() {
-            self.clause(vec![!*v, result]);
+            self.implies_clause(*v, result);
         }
         // result => or(vars)
-        self.clause(std::iter::once(!result).chain(vars).collect());
+        self.implies_or_clause(result, vars);
 
         result
     }
     pub fn xor_var(&mut self, a: Lit, b: Lit) -> Lit {
-        if a == Lit::FALSE {
-            return b;
-        }
-        if a == Lit::TRUE {
-            return !b;
-        }
-        if b == Lit::FALSE {
-            return a;
-        }
-        if b == Lit::TRUE {
-            return !a;
-        }
-
         let result = self.var();
-        self.clause(vec![!a, !b, !result]);
-        self.clause(vec![a, b, !result]);
-        self.clause(vec![a, !b, result]);
-        self.clause(vec![!a, b, result]);
+        self.or_clause(&[!a, !b, !result]);
+        self.or_clause(&[a, b, !result]);
+        self.or_clause(&[a, !b, result]);
+        self.or_clause(&[!a, b, result]);
         result
     }
     pub fn eq_var(&mut self, a: Lit, b: Lit) -> Lit {
         self.xor_var(a, !b)
     }
-    pub fn count_up_to(&mut self, up_to: usize, vars: &[Lit]) -> Vec<Lit> {
-        let mut prior = vec![Lit::FALSE; up_to + 1];
-        prior[0] = Lit::TRUE;
-        for v in vars.iter().copied() {
-            let mut row = Vec::with_capacity(up_to + 1);
-            row.push(Lit::TRUE);
-            for c in 1..=up_to {
-                row.push(self.count(prior[c - 1], prior[c], v));
-            }
-
-            prior = row;
+    fn count_up_to_vars(&mut self, up_to: usize, vars: &[Lit]) -> Vec<Lit> {
+        let mut prior = vec![];
+        if up_to == 0 {
+            return prior;
+        }
+        for v in vars {
+            let row_len = up_to.min(prior.len() + 1);
+            prior = (0..row_len)
+                .into_iter()
+                .map(|c| self.count_var(&prior, c, *v))
+                .collect_vec();
         }
         prior
     }
-    fn count(&mut self, prior_minus_one: Lit, prior: Lit, var: Lit) -> Lit {
-        if prior_minus_one == Lit::FALSE {
-            return Lit::FALSE;
+    fn count_var(&mut self, all_prior: &[Lit], c: usize, var: Lit) -> Lit {
+        if c == 0 {
+            if let Some(prior) = all_prior.first() {
+                // prior | var
+                return self.or_var(&[*prior, var]);
+            } else {
+                // no prior, so must be first iteration
+                return var;
+            }
         }
-        if prior == Lit::TRUE {
-            return Lit::TRUE;
-        }
-        if var == Lit::FALSE {
-            return prior;
-        }
-        if var == Lit::TRUE {
-            return prior_minus_one;
+        if c == all_prior.len() {
+            // prior_minus_one & var
+            return self.and_var(&[all_prior[c - 1], var]);
         }
 
         let result = self.var();
+        let prior_minus_one = all_prior[c - 1];
+        let prior = all_prior[c];
+
         // r == (m&v) | p
         // r => (m&v) | p & (m&v) | p => r
         // !r | (m&v) | p & !((m&v) | p) | r
@@ -200,28 +145,11 @@ impl Problem {
         // !r|m|p & !r|v|p & !m|!v|r & !m|!p|r & !p|!v|r & !p|!p|r
         // !r|m|p & !r|v|p & r|!m|!v & r|!m|!p & r|!v|!p & r|!p
         // remove r|!m|!p , r|!v|!p because they imply r|!p
-        self.clause(vec![!result, prior_minus_one, prior]); // result => prior_minus_one | prior
-        self.clause(vec![!result, prior, var]); // result => prior | var
-        self.clause(vec![!prior_minus_one, !var, result]); // prior_minus_one & var => result
-        self.clause(vec![!prior, result]); // prior => result
+        self.or_clause(&[!result, prior_minus_one, prior]);
+        self.or_clause(&[!result, prior, var]);
+        self.or_clause(&[!prior_minus_one, !var, result]);
+        self.or_clause(&[!prior, result]);
 
         result
-    }
-}
-
-impl Problem {
-    pub fn write_dimacs(&self, mut w: impl Write) -> std::io::Result<()> {
-        writeln!(w, "p cnf {} {}", self.num_variables, self.clauses.len())?;
-        for clause in self.clauses.iter() {
-            for var in clause {
-                if var.is_negative() {
-                    write!(w, "-{} ", var.id())?;
-                } else {
-                    write!(w, "{} ", var.id())?;
-                }
-            }
-            writeln!(w, "0")?;
-        }
-        Ok(())
     }
 }
