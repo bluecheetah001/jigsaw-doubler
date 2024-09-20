@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+
 use itertools::Itertools;
 use varisat::cnf::CnfFormula;
-use varisat::{ExtendFormula, Lit};
+use varisat::{ExtendFormula, Lit, Solver, Var};
 
 #[derive(Debug)]
 pub struct SatProblem {
@@ -12,6 +14,17 @@ impl SatProblem {
             cnf: CnfFormula::new(),
         }
     }
+    pub fn solve(&self) -> SatSolution {
+        let mut solver = Solver::new();
+        solver.add_formula(&self.cnf);
+        let satisfiable = solver.solve().unwrap();
+        if satisfiable {
+            SatSolution::new(solver.model().unwrap())
+        } else {
+            panic!("not satisfiable")
+        }
+    }
+
     /// allocate a new var
     pub fn var(&mut self) -> Lit {
         self.cnf.new_var().positive()
@@ -55,15 +68,14 @@ impl SatProblem {
         // short-circuit / optimize a few obvious edge cases
         if count == 0 {
             self.nor_clause(vars);
-        }
-        if count == vars.len() {
+        } else if count == vars.len() {
             self.and_clause(vars);
-        }
-        if count > vars.len() {
+        } else if count > vars.len() {
             panic!("not satisfiable")
+        } else {
+            let count_greater_than = self.count_up_to_vars(count + 1, vars);
+            self.and_clause(&[count_greater_than[count - 1], !count_greater_than[count]]);
         }
-        let count_greater_than = self.count_up_to_vars(count + 1, vars);
-        self.and_clause(&[count_greater_than[count - 1], !count_greater_than[count]]);
     }
 
     // tseytin transform
@@ -153,3 +165,23 @@ impl SatProblem {
         result
     }
 }
+
+#[derive(Debug)]
+pub struct SatSolution {
+    true_vars: HashSet<Lit>,
+}
+impl SatSolution {
+    pub fn new(vars: Vec<Lit>) -> Self {
+        let true_vars = vars.into_iter().filter(|v| v.is_positive()).collect();
+        Self { true_vars }
+    }
+    pub fn get(&self, var: Lit) -> bool {
+        if var.is_positive() {
+            self.true_vars.contains(&var)
+        } else {
+            !self.true_vars.contains(&!var)
+        }
+    }
+}
+
+// TODO tests! (specifically exact_count_clause)
