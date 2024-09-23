@@ -176,28 +176,32 @@ impl Puzzle for SquarePuzzle {
     }
 
     fn piece_orbit(&self, piece: PieceKey) -> PieceOrbitKey {
+        if piece == PieceKey(0) {
+            // ul corner is given a dedicated orbit to break rotational symmetry of the puzzle
+            return PieceOrbitKey(0);
+        }
         let piece = self.piece_loc(piece);
         let inner_row = piece.row > 0 && piece.row < self.last_row();
         let inner_col = piece.col > 0 && piece.col < self.last_col();
-        PieceOrbitKey(inner_row as usize + inner_col as usize)
+        PieceOrbitKey(1 + inner_row as usize + inner_col as usize)
     }
 
     fn piece_orbit_info(&self, orbit: PieceOrbitKey) -> PieceOrbitInfo {
         match orbit.0 {
             // corners
-            0 => PieceOrbitInfo {
+            0 | 1 => PieceOrbitInfo {
                 rotations: 1,
                 edges: 2,
                 edge_increment_per_rotation: 2,
             },
             // edges
-            1 => PieceOrbitInfo {
+            2 => PieceOrbitInfo {
                 rotations: 1,
                 edges: 3,
                 edge_increment_per_rotation: 3,
             },
             // centers
-            2 => PieceOrbitInfo {
+            3 => PieceOrbitInfo {
                 rotations: 4,
                 edges: 4,
                 edge_increment_per_rotation: 1,

@@ -9,10 +9,57 @@ use sat::*;
 use varisat::Lit;
 
 fn main() {
-    let puzzle = SquarePuzzle::new(3, 3);
+    let puzzle = SquarePuzzle::new(5, 5);
     JigsawDoubler::run(puzzle);
     println!("Hello, world!");
 }
+
+// 0: base
+// .--.--.--.  .--.--.--.
+// |  0  1  |  | 0| 1| 2|
+// .-6.-7.-8.  .--.--.--.
+// |  2  3  |  | 3| 4| 5|
+// .-9.10.11.  .--.--.--.
+// |  4  5  |  | 6| 7| 8|
+// .--.--.--.  .--.--.--.
+//
+// 1: rotate edges 180
+// .--.--.--.  .--.--.--.
+// |  0  1  |  | 0| 7| 2|
+// .-6.-7.-8.  .--.--.--.
+// |  2  2  |  | 5| 4| 3|
+// .-8.-7.-6.  .--.--.--.
+// |  1  0  |  | 6| 1| 8|
+// .--.--.--.  .--.--.--.
+//
+// 2: rotates edges 90
+// .--.--.--.  .--.--.--.
+// |  0  1  |  | 0| 3| 6|
+// .-4.-7.-5.  .--.--.--.
+// |  2  2  |  | 7| 4| 1|
+// .-0.-7.-1.  .--.--.--.
+// |  4  5  |  | 2| 5| 8|
+// .--.--.--.  .--.--.--.
+//
+// 3: reflect edges on \
+// .--.--.--.  .--.--.--.
+// |  0  1  |  | 0| 3| 2|
+// .-1.-3.-5.  .--.--.--.
+// |  2  3  |  | 1| 4| 7|
+// .-0.-2.-4.  .--.--.--.
+// |  4  5  |  | 6| 5| 8|
+// .--.--.--.  .--.--.--.
+//
+// 4: rotate edges 270 and reflect corners on \
+// .--.--.--.  .--.--.--.
+// |  0  1  |  | 0| 5| 6|
+// .-1.-7.-0.  .--.--.--.
+// |  2  2  |  | 1| 4| 7|
+// .-5.-7.-4.  .--.--.--.
+// |  4  5  |  | 2| 3| 8|
+// .--.--.--.  .--.--.--.
+//
+// 5, 6, 7  - probably more like above
 
 struct MatchingVars<T>(HashMap<(T, T), Lit>);
 impl<T: Ord + Hash> MatchingVars<T> {
@@ -72,16 +119,20 @@ impl<P: Puzzle> JigsawDoubler<P> {
         s.add_piece_one_hot_dest();
         s.add_piece_one_hot_rot();
         s.add_piece_one_hot_src();
-        // s.add_piece_dest_adjacent_vars();
-        // s.add_piece_dest_adjacent_not_same();
-        // s.add_piece_dest_adjacent_to_matching();
+        s.add_piece_dest_adjacent_vars();
+        s.add_piece_dest_adjacent_not_same();
+        s.add_piece_dest_adjacent_to_matching();
 
-        let solution = s.sat.solve();
-
-        s.print_edge_matching(&solution);
-        s.print_piece_dest_rot(&solution);
-
-        // TODO run problem
+        let mut count = 0;
+        while let Some(solution) = s.sat.solve() {
+            count += 1;
+            println!("found solution {}", count);
+            s.print_edge_matching(&solution);
+            s.print_piece_dest_rot(&solution);
+            println!();
+            s.add_prior_solution(&solution)
+        }
+        println!("no more solutions, {} in total", count)
 
         // TODO extract result
     }
@@ -109,11 +160,19 @@ impl<P: Puzzle> JigsawDoubler<P> {
     }
     fn print_edge_matching(&self, solution: &SatSolution) {
         for a in EdgeKey::iter(self.puzzle.num_edges()) {
-            for b in EdgeKey::iter(a.0) {
-                if let Some(matches) = self.edge_matching_vars.get(a, b) {
-                    println!("{} matches {} = {}", a.0, b.0, solution.get(matches))
-                }
-            }
+            println!(
+                "{} matches [{}]",
+                a.0,
+                EdgeKey::iter(self.puzzle.num_edges())
+                    .filter(|b| b != &a)
+                    .filter(|b| self
+                        .edge_matching_vars
+                        .get(a, *b)
+                        .map(|v| solution.get(v))
+                        .unwrap_or(false))
+                    .map(|b| b.0)
+                    .format(",")
+            );
         }
     }
 
@@ -139,17 +198,28 @@ impl<P: Puzzle> JigsawDoubler<P> {
     }
     fn print_piece_dest_rot(&self, solution: &SatSolution) {
         for src in PieceKey::iter(self.puzzle.num_pieces()) {
-            for dest in PieceKey::iter(self.puzzle.num_pieces()) {
-                if let Some(var) = self.piece_dest_vars.get(src, dest) {
-                    println!("{} goes to {} = {}", src.0, dest.0, solution.get(var))
-                }
-            }
             let src_orbit = self.puzzle.piece_orbit(src);
             let src_info = self.puzzle.piece_orbit_info(src_orbit);
-            for rot in 0..src_info.rotations {
-                let var = self.piece_dest_rot_vars.get(src, rot).unwrap();
-                println!("{} rotates {} = {}", src.0, rot, solution.get(var))
-            }
+
+            println!(
+                "{} goes to [{}] rotate [{}]",
+                src.0,
+                PieceKey::iter(self.puzzle.num_pieces())
+                    .filter(|dest| self
+                        .piece_dest_vars
+                        .get(src, *dest)
+                        .map(|v| solution.get(v))
+                        .unwrap_or(false))
+                    .map(|dest| dest.0)
+                    .format(","),
+                (0..src_info.rotations)
+                    .filter(|rot| self
+                        .piece_dest_rot_vars
+                        .get(src, *rot)
+                        .map(|v| solution.get(v))
+                        .unwrap_or(false))
+                    .format(",")
+            );
         }
     }
 
@@ -277,7 +347,6 @@ impl<P: Puzzle> JigsawDoubler<P> {
     fn add_piece_dest_adjacent_not_same(&mut self) {
         for edge in EdgeKey::iter(self.puzzle.num_edges()) {
             let [a, b] = self.puzzle.edge_pieces(edge);
-            println!("{a:?} {b:?}");
             self.sat
                 .not_clause(self.piece_dest_adjacent_vars.get(a, b).unwrap());
         }
@@ -313,5 +382,16 @@ impl<P: Puzzle> JigsawDoubler<P> {
                 }
             }
         }
+    }
+
+    fn add_prior_solution(&mut self, solution: &SatSolution) {
+        let differ_vars = self
+            .edge_matching_vars
+            .0
+            .values()
+            .map(|&v| if solution.get(v) { !v } else { v })
+            .collect_vec();
+        self.sat.or_clause(&differ_vars);
+        // TODO add clause for each global rotation and mirror
     }
 }
