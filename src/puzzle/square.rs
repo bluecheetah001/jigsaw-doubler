@@ -1,4 +1,7 @@
-use super::{EdgeKey, EdgeOrbitKey, PieceKey, PieceKeyEdge, PieceOrbitInfo, PieceOrbitKey, Puzzle};
+use super::{
+    EdgeKey, EdgeOrbitKey, PieceKey, PieceKeyEdge, PieceOrbitInfo, PieceOrbitKey, Puzzle,
+    SymmetryKey,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PieceLoc {
@@ -102,6 +105,8 @@ impl SquarePuzzle {
         // rows or cols == 1 changes orbits, so is disallowed for simplicity
         assert!(rows >= 2);
         assert!(cols >= 2);
+        // rows + cols must be even to have an even number of edges
+        assert!((rows + cols) % 2 == 0);
         Self { rows, cols }
     }
     fn num_vert_edges(&self) -> usize {
@@ -167,6 +172,28 @@ impl SquarePuzzle {
             EdgeSide::Down => {
                 EdgeKey(self.num_vert_edges() + edge.loc.row * self.cols + edge.loc.col)
             }
+        }
+    }
+
+    fn global_reflect_vert_edge(&self, edge: EdgeLoc) -> EdgeLoc {
+        match edge.side {
+            EdgeSide::Right => EdgeLoc::new_right(self.last_row() - edge.loc.row, edge.loc.col),
+            EdgeSide::Down => EdgeLoc::new_down(self.last_row() - 1 - edge.loc.row, edge.loc.col),
+        }
+    }
+    fn global_reflect_horiz_edge(&self, edge: EdgeLoc) -> EdgeLoc {
+        match edge.side {
+            EdgeSide::Right => EdgeLoc::new_right(edge.loc.row, self.last_col() - 1 - edge.loc.col),
+            EdgeSide::Down => EdgeLoc::new_down(edge.loc.row, self.last_col() - edge.loc.col),
+        }
+    }
+    fn global_rotate_90_edge(&self, edge: EdgeLoc) -> EdgeLoc {
+        // self.rows is known to equal self.cols if we get here
+        debug_assert_eq!(self.rows, self.cols);
+        let side_max = self.last_row();
+        match edge.side {
+            EdgeSide::Right => EdgeLoc::new_down(edge.loc.col, side_max - edge.loc.row),
+            EdgeSide::Down => EdgeLoc::new_right(edge.loc.col, side_max - 1 - edge.loc.row),
         }
     }
 }
@@ -236,18 +263,6 @@ impl Puzzle for SquarePuzzle {
         self.edge_key(edge_loc)
     }
 
-    fn piece_neighbor(&self, piece_edge: PieceKeyEdge) -> PieceKeyEdge {
-        let loc = self.piece_loc(piece_edge.piece);
-        let edge = (piece_edge.edge + self.implicit_rotation(loc)) % 4;
-        match edge {
-            0 => self.piece_key_edge(loc.up_piece(), 2),
-            1 => self.piece_key_edge(loc.right_piece(), 3),
-            2 => self.piece_key_edge(loc.down_piece(), 0),
-            3 => self.piece_key_edge(loc.left_piece(), 1),
-            _ => unreachable!(),
-        }
-    }
-
     fn edge_pieces(&self, edge: EdgeKey) -> [PieceKeyEdge; 2] {
         let edge_loc = self.edge_loc(edge);
         match edge_loc.side {
@@ -260,6 +275,30 @@ impl Puzzle for SquarePuzzle {
                 self.piece_key_edge(edge_loc.loc.down_piece(), 0),
             ],
         }
+    }
+
+    fn num_global_symmetries(&self) -> usize {
+        if self.rows == self.cols {
+            8
+        } else {
+            4
+        }
+    }
+
+    fn edge_global_symmetry(&self, edge: EdgeKey, symmetry: SymmetryKey) -> EdgeKey {
+        assert!(symmetry.0 < self.num_global_symmetries());
+        let mut edge_loc = self.edge_loc(edge);
+        // decompose symmetries as vertical reflection, horizontal reflection, and 90 rotation
+        if symmetry.0 & 1 == 1 {
+            edge_loc = self.global_reflect_vert_edge(edge_loc);
+        }
+        if symmetry.0 & 2 == 2 {
+            edge_loc = self.global_reflect_horiz_edge(edge_loc);
+        }
+        if symmetry.0 & 4 == 4 {
+            edge_loc = self.global_rotate_90_edge(edge_loc);
+        }
+        self.edge_key(edge_loc)
     }
 }
 

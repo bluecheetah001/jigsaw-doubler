@@ -37,6 +37,14 @@ impl PieceKeyEdge {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SymmetryKey(pub usize);
+impl SymmetryKey {
+    pub fn iter(len: usize) -> impl Iterator<Item = SymmetryKey> {
+        (0..len).map(SymmetryKey)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PieceOrbitInfo {
     /// how many ways a piece can be put into a single location
@@ -64,7 +72,8 @@ pub trait Puzzle {
     fn edge_orbit(&self, edge: EdgeKey) -> EdgeOrbitKey;
 
     fn piece_edge(&self, piece_edge: PieceKeyEdge) -> EdgeKey;
-    fn piece_neighbor(&self, piece_edge: PieceKeyEdge) -> PieceKeyEdge;
-
     fn edge_pieces(&self, edge: EdgeKey) -> [PieceKeyEdge; 2];
+
+    fn num_global_symmetries(&self) -> usize;
+    fn edge_global_symmetry(&self, edge: EdgeKey, symmetry: SymmetryKey) -> EdgeKey;
 }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::time::Instant;
 
 mod puzzle;
 mod sat;
@@ -9,57 +10,10 @@ use sat::*;
 use varisat::Lit;
 
 fn main() {
+    let start_time = Instant::now();
     let puzzle = SquarePuzzle::new(5, 5);
-    JigsawDoubler::run(puzzle);
-    println!("Hello, world!");
+    JigsawDoubler::run(puzzle, start_time);
 }
-
-// 0: base
-// .--.--.--.  .--.--.--.
-// |  0  1  |  | 0| 1| 2|
-// .-6.-7.-8.  .--.--.--.
-// |  2  3  |  | 3| 4| 5|
-// .-9.10.11.  .--.--.--.
-// |  4  5  |  | 6| 7| 8|
-// .--.--.--.  .--.--.--.
-//
-// 1: rotate edges 180
-// .--.--.--.  .--.--.--.
-// |  0  1  |  | 0| 7| 2|
-// .-6.-7.-8.  .--.--.--.
-// |  2  2  |  | 5| 4| 3|
-// .-8.-7.-6.  .--.--.--.
-// |  1  0  |  | 6| 1| 8|
-// .--.--.--.  .--.--.--.
-//
-// 2: rotates edges 90
-// .--.--.--.  .--.--.--.
-// |  0  1  |  | 0| 3| 6|
-// .-4.-7.-5.  .--.--.--.
-// |  2  2  |  | 7| 4| 1|
-// .-0.-7.-1.  .--.--.--.
-// |  4  5  |  | 2| 5| 8|
-// .--.--.--.  .--.--.--.
-//
-// 3: reflect edges on \
-// .--.--.--.  .--.--.--.
-// |  0  1  |  | 0| 3| 2|
-// .-1.-3.-5.  .--.--.--.
-// |  2  3  |  | 1| 4| 7|
-// .-0.-2.-4.  .--.--.--.
-// |  4  5  |  | 6| 5| 8|
-// .--.--.--.  .--.--.--.
-//
-// 4: rotate edges 270 and reflect corners on \
-// .--.--.--.  .--.--.--.
-// |  0  1  |  | 0| 5| 6|
-// .-1.-7.-0.  .--.--.--.
-// |  2  2  |  | 1| 4| 7|
-// .-5.-7.-4.  .--.--.--.
-// |  4  5  |  | 2| 3| 8|
-// .--.--.--.  .--.--.--.
-//
-// 5, 6, 7  - probably more like above
 
 struct MatchingVars<T>(HashMap<(T, T), Lit>);
 impl<T: Ord + Hash> MatchingVars<T> {
@@ -109,7 +63,7 @@ struct JigsawDoubler<P> {
     piece_dest_adjacent_vars: MatchingVars<PieceKeyEdge>,
 }
 impl<P: Puzzle> JigsawDoubler<P> {
-    pub fn run(puzzle: P) {
+    pub fn run(puzzle: P, start_time: Instant) {
         let mut s = Self::new(puzzle);
 
         s.add_edge_matching_vars();
@@ -123,18 +77,31 @@ impl<P: Puzzle> JigsawDoubler<P> {
         s.add_piece_dest_adjacent_not_same();
         s.add_piece_dest_adjacent_to_matching();
 
+        println!("constraints configured, starting solve");
+        let mut last = start_time;
         let mut count = 0;
         while let Some(solution) = s.sat.solve() {
+            let now = Instant::now();
             count += 1;
-            println!("found solution {}", count);
+            println!(
+                "found solution {} in {} ({} total)",
+                count,
+                humantime::format_duration(now - last),
+                humantime::format_duration(now - start_time)
+            );
             s.print_edge_matching(&solution);
             s.print_piece_dest_rot(&solution);
             println!();
-            s.add_prior_solution(&solution)
+            s.add_prior_solution(&solution);
+            last = now;
         }
-        println!("no more solutions, {} in total", count)
 
-        // TODO extract result
+        let now = Instant::now();
+        println!(
+            "no more solutions. found {} solutions in {}",
+            count,
+            humantime::format_duration(now - start_time)
+        )
     }
     fn new(puzzle: P) -> Self {
         Self {
@@ -385,13 +352,24 @@ impl<P: Puzzle> JigsawDoubler<P> {
     }
 
     fn add_prior_solution(&mut self, solution: &SatSolution) {
-        let differ_vars = self
-            .edge_matching_vars
-            .0
-            .values()
-            .map(|&v| if solution.get(v) { !v } else { v })
-            .collect_vec();
-        self.sat.or_clause(&differ_vars);
-        // TODO add clause for each global rotation and mirror
+        for symmetry in SymmetryKey::iter(self.puzzle.num_global_symmetries()) {
+            let puzzle = &self.puzzle;
+            let edge_matching_vars = &self.edge_matching_vars;
+            let differ_vars = EdgeKey::iter(puzzle.num_edges())
+                .flat_map(|a| EdgeKey::iter(a.0).map(move |b| (a, b)))
+                .filter_map(|(a, b)| {
+                    let matches = solution.get(edge_matching_vars.get(a, b)?);
+                    let a = puzzle.edge_global_symmetry(a, symmetry);
+                    let b = puzzle.edge_global_symmetry(b, symmetry);
+                    let v = edge_matching_vars.get(a, b).unwrap();
+                    if matches {
+                        Some(!v)
+                    } else {
+                        Some(v)
+                    }
+                })
+                .collect_vec();
+            self.sat.or_clause(&differ_vars);
+        }
     }
 }
