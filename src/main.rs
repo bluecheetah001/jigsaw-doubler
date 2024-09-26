@@ -21,7 +21,6 @@ impl<T: Ord + Hash> MatchingVars<T> {
         Self(HashMap::new())
     }
     fn key(a: T, b: T) -> (T, T) {
-        assert!(a != b);
         if a < b {
             (a, b)
         } else {
@@ -57,25 +56,21 @@ impl<T: Eq + Hash, U: Eq + Hash> TableVars<T, U> {
 struct JigsawDoubler<P> {
     puzzle: P,
     sat: SatProblem,
+    point_dest_vars: TableVars<PointKey, PointKey>,
+    point_dest_adjacent_vars: MatchingVars<PointKey>,
     edge_matching_vars: MatchingVars<EdgeKey>,
-    piece_dest_vars: TableVars<PieceKey, PieceKey>,
-    piece_dest_rot_vars: TableVars<PieceKey, usize>,
-    piece_dest_adjacent_vars: MatchingVars<PieceKeyEdge>,
 }
 impl<P: Puzzle> JigsawDoubler<P> {
     pub fn run(puzzle: P, start_time: Instant) {
         let mut s = Self::new(puzzle);
 
+        s.add_point_dest_vars();
+        s.add_one_hot_point_dest();
+        s.add_one_hot_point_src();
+        s.add_point_dest_adjacent_vars();
+        s.add_point_dest_adjacent_not_same();
         s.add_edge_matching_vars();
-        s.add_piece_dest_vars();
-        s.add_piece_dest_rot_vars();
-        s.add_edge_one_hot_matching();
-        s.add_piece_one_hot_dest();
-        s.add_piece_one_hot_rot();
-        s.add_piece_one_hot_src();
-        s.add_piece_dest_adjacent_vars();
-        s.add_piece_dest_adjacent_not_same();
-        s.add_piece_dest_adjacent_to_matching();
+        s.add_one_hot_edge_matching();
 
         println!("constraints configured, starting solve");
         let mut last = start_time;
@@ -89,8 +84,8 @@ impl<P: Puzzle> JigsawDoubler<P> {
                 humantime::format_duration(now - last),
                 humantime::format_duration(now - start_time)
             );
+            s.print_point_dest(&solution);
             s.print_edge_matching(&solution);
-            s.print_piece_dest_rot(&solution);
             println!();
             s.add_prior_solution(&solution);
             last = now;
@@ -107,269 +102,160 @@ impl<P: Puzzle> JigsawDoubler<P> {
         Self {
             puzzle,
             sat: SatProblem::new(),
+            point_dest_vars: TableVars::new(),
+            point_dest_adjacent_vars: MatchingVars::new(),
             edge_matching_vars: MatchingVars::new(),
-            piece_dest_vars: TableVars::new(),
-            piece_dest_rot_vars: TableVars::new(),
-            piece_dest_adjacent_vars: MatchingVars::new(),
+        }
+    }
+
+    fn add_point_dest_vars(&mut self) {
+        // create var for each src_piece dest_point pair
+        for src_piece in puzzle_pieces(&self.puzzle) {
+            let src_point = self.puzzle.arbitrary_point_on_piece(src_piece);
+            for dest_point in puzzle_exchange_points(&self.puzzle, src_point) {
+                let var = self.sat.var();
+
+                // and write to all implied src_point dest_point pairs
+                let mut src_point_other = src_point;
+                let mut dest_point_other = dest_point;
+                loop {
+                    self.point_dest_vars
+                        .put(src_point_other, dest_point_other, var);
+                    src_point_other = self.puzzle.next_point_on_piece(src_point_other);
+                    dest_point_other = self.puzzle.next_point_on_piece(dest_point_other);
+                    if src_point_other == src_point {
+                        debug_assert_eq!(dest_point_other, dest_point);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    fn add_one_hot_point_dest(&mut self) {
+        for src_piece in puzzle_pieces(&self.puzzle) {
+            let src_point = self.puzzle.arbitrary_point_on_piece(src_piece);
+            let dest_vars = puzzle_points(&self.puzzle)
+                .filter_map(|dest_point| self.point_dest_vars.get(src_point, dest_point))
+                .collect_vec();
+            self.sat.exact_count_clause(1, &dest_vars);
+        }
+    }
+    fn add_one_hot_point_src(&mut self) {
+        for dest_piece in puzzle_pieces(&self.puzzle) {
+            let dest_point = self.puzzle.arbitrary_point_on_piece(dest_piece);
+            let src_vars = puzzle_points(&self.puzzle)
+                .filter_map(|src_point| self.point_dest_vars.get(src_point, dest_point))
+                .collect_vec();
+            self.sat.exact_count_clause(1, &src_vars);
+        }
+    }
+
+    fn add_point_dest_adjacent_vars(&mut self) {
+        for (src_point_a, src_point_b) in puzzle_point_pairs(&self.puzzle) {
+            let dest_adj_vars = puzzle_points(&self.puzzle)
+                .filter_map(|dest_point_a| {
+                    let var_a = self.point_dest_vars.get(src_point_a, dest_point_a)?;
+                    let dest_point_b = self.puzzle.other_point_on_edge(dest_point_a);
+                    let var_b = self.point_dest_vars.get(src_point_b, dest_point_b)?;
+                    Some(self.sat.and_var(&[var_a, var_b]))
+                })
+                .collect_vec();
+            let dest_adj_var = self.sat.or_var(&dest_adj_vars);
+            self.point_dest_adjacent_vars
+                .put(src_point_a, src_point_b, dest_adj_var);
+        }
+    }
+    fn add_point_dest_adjacent_not_same(&mut self) {
+        for edge in puzzle_edges(&self.puzzle) {
+            let point_1 = self.puzzle.arbitrary_point_on_edge(edge);
+            let point_2 = self.puzzle.other_point_on_edge(point_1);
+            let stays_adjacent_var = self.point_dest_adjacent_vars.get(point_1, point_2).unwrap();
+            self.sat.not_clause(stays_adjacent_var);
         }
     }
 
     fn add_edge_matching_vars(&mut self) {
-        for a in EdgeKey::iter(self.puzzle.num_edges()) {
-            let a_orbit: EdgeOrbitKey = self.puzzle.edge_orbit(a);
-            for b in EdgeKey::iter(a.0) {
-                let b_orbit = self.puzzle.edge_orbit(b);
-                if a_orbit == b_orbit {
-                    self.edge_matching_vars.put(a, b, self.sat.var());
-                }
+        for (edge_a, edge_b) in puzzle_edge_pairs(&self.puzzle) {
+            let point_a1 = self.puzzle.arbitrary_point_on_edge(edge_a);
+            let point_a2 = self.puzzle.other_point_on_edge(point_a1);
+            let point_b1 = self.puzzle.arbitrary_point_on_edge(edge_b);
+            let point_b2 = self.puzzle.other_point_on_edge(point_b1);
+            let matching_vars = [
+                self.point_dest_adjacent_vars.get(point_a1, point_b1),
+                self.point_dest_adjacent_vars.get(point_a1, point_b2),
+                self.point_dest_adjacent_vars.get(point_a2, point_b1),
+                self.point_dest_adjacent_vars.get(point_a2, point_b2),
+            ]
+            .into_iter()
+            .filter_map(|v| v)
+            .collect_vec();
+            if !matching_vars.is_empty() {
+                let matching_var = self.sat.or_var(&matching_vars);
+                self.edge_matching_vars.put(edge_a, edge_b, matching_var);
             }
         }
+    }
+    fn add_one_hot_edge_matching(&mut self) {
+        for edge_a in puzzle_edges(&self.puzzle) {
+            let matching_vars = puzzle_edges(&self.puzzle)
+                .filter_map(|edge_b| self.edge_matching_vars.get(edge_a, edge_b))
+                .collect_vec();
+            self.sat.exact_count_clause(1, &matching_vars);
+        }
+    }
+
+    fn print_point_dest(&self, solution: &SatSolution) {
+        println!(
+            "piece dest: {}",
+            puzzle_pieces(&self.puzzle)
+                .map(|src_piece| self.puzzle.arbitrary_point_on_piece(src_piece))
+                .flat_map(|src_point| puzzle_points(&self.puzzle)
+                    .map(move |dest_point| (src_point, dest_point)))
+                .filter(|&(src_point, dest_point)| {
+                    self.point_dest_vars
+                        .get(src_point, dest_point)
+                        .map(|var| solution.get(var))
+                        .unwrap_or(false)
+                })
+                .map(|(edge_a, edge_b)| format!(
+                    "{}=>{}",
+                    self.puzzle.format_point(edge_a),
+                    self.puzzle.format_point(edge_b)
+                ))
+                .format(" ")
+        )
     }
     fn print_edge_matching(&self, solution: &SatSolution) {
-        for a in EdgeKey::iter(self.puzzle.num_edges()) {
-            println!(
-                "{} matches [{}]",
-                a.0,
-                EdgeKey::iter(self.puzzle.num_edges())
-                    .filter(|b| b != &a)
-                    .filter(|b| self
-                        .edge_matching_vars
-                        .get(a, *b)
-                        .map(|v| solution.get(v))
-                        .unwrap_or(false))
-                    .map(|b| b.0)
-                    .format(",")
-            );
-        }
-    }
-
-    fn add_piece_dest_vars(&mut self) {
-        for src in PieceKey::iter(self.puzzle.num_pieces()) {
-            let src_orbit = self.puzzle.piece_orbit(src);
-            for dest in PieceKey::iter(self.puzzle.num_pieces()) {
-                let dest_orbit = self.puzzle.piece_orbit(dest);
-                if src_orbit == dest_orbit {
-                    self.piece_dest_vars.put(src, dest, self.sat.var());
-                }
-            }
-        }
-    }
-    fn add_piece_dest_rot_vars(&mut self) {
-        for src in PieceKey::iter(self.puzzle.num_pieces()) {
-            let src_orbit = self.puzzle.piece_orbit(src);
-            let src_info = self.puzzle.piece_orbit_info(src_orbit);
-            for rot in 0..src_info.rotations {
-                self.piece_dest_rot_vars.put(src, rot, self.sat.var());
-            }
-        }
-    }
-    fn print_piece_dest_rot(&self, solution: &SatSolution) {
-        for src in PieceKey::iter(self.puzzle.num_pieces()) {
-            let src_orbit = self.puzzle.piece_orbit(src);
-            let src_info = self.puzzle.piece_orbit_info(src_orbit);
-
-            println!(
-                "{} goes to [{}] rotate [{}]",
-                src.0,
-                PieceKey::iter(self.puzzle.num_pieces())
-                    .filter(|dest| self
-                        .piece_dest_vars
-                        .get(src, *dest)
-                        .map(|v| solution.get(v))
-                        .unwrap_or(false))
-                    .map(|dest| dest.0)
-                    .format(","),
-                (0..src_info.rotations)
-                    .filter(|rot| self
-                        .piece_dest_rot_vars
-                        .get(src, *rot)
-                        .map(|v| solution.get(v))
-                        .unwrap_or(false))
-                    .format(",")
-            );
-        }
-    }
-
-    fn add_edge_one_hot_matching(&mut self) {
-        for a in EdgeKey::iter(self.puzzle.num_edges()) {
-            let a_matches = EdgeKey::iter(self.puzzle.num_edges())
-                .filter(|b| *b != a)
-                .filter_map(|b| self.edge_matching_vars.get(a, b))
-                .collect_vec();
-            self.sat.exact_count_clause(1, &a_matches);
-        }
-    }
-    fn add_piece_one_hot_dest(&mut self) {
-        for src in PieceKey::iter(self.puzzle.num_pieces()) {
-            let src_dest = PieceKey::iter(self.puzzle.num_pieces())
-                .filter_map(|dest| self.piece_dest_vars.get(src, dest))
-                .collect_vec();
-            self.sat.exact_count_clause(1, &src_dest);
-        }
-    }
-    fn add_piece_one_hot_rot(&mut self) {
-        for src in PieceKey::iter(self.puzzle.num_pieces()) {
-            let src_orbit = self.puzzle.piece_orbit(src);
-            let src_info = self.puzzle.piece_orbit_info(src_orbit);
-            let src_dest_rot = (0..src_info.rotations)
-                .map(|rot| self.piece_dest_rot_vars.get(src, rot).unwrap())
-                .collect_vec();
-            self.sat.exact_count_clause(1, &src_dest_rot);
-        }
-    }
-    fn add_piece_one_hot_src(&mut self) {
-        for dest in PieceKey::iter(self.puzzle.num_pieces()) {
-            let dest_src = PieceKey::iter(self.puzzle.num_pieces())
-                .filter_map(|src| self.piece_dest_vars.get(src, dest))
-                .collect_vec();
-            self.sat.exact_count_clause(1, &dest_src);
-        }
-    }
-
-    fn add_piece_dest_adjacent_vars(&mut self) {
-        fn rotation_from_edge(
-            info: PieceOrbitInfo,
-            src_edge: usize,
-            dest_edge: usize,
-        ) -> Option<usize> {
-            // TODO don't do this the dumb way
-            for rot in 0..info.rotations {
-                if (src_edge + rot * info.edge_increment_per_rotation) % info.edges == dest_edge {
-                    return Some(rot);
-                }
-            }
-            // edge pieces can't rotate but their edges are in the same orbit
-            None
-        }
-
-        // loop over all PieceKeyEdge pairs who's edge share an orbit
-        for a_piece in PieceKey::iter(self.puzzle.num_pieces()) {
-            let a_orbit = self.puzzle.piece_orbit(a_piece);
-            let a_info = self.puzzle.piece_orbit_info(a_orbit);
-            for a_piece_edge in a_piece.edges(a_info.edges) {
-                let a_edge = self.puzzle.piece_edge(a_piece_edge);
-                let a_edge_orbit = self.puzzle.edge_orbit(a_edge);
-                // iter over b_pieces that are <= a_pieces
-                for b_piece in PieceKey::iter(a_piece.0 + 1) {
-                    let b_orbit = self.puzzle.piece_orbit(b_piece);
-                    let b_info = self.puzzle.piece_orbit_info(b_orbit);
-                    for b_piece_edge in b_piece.edges(b_info.edges) {
-                        let b_edge = self.puzzle.piece_edge(b_piece_edge);
-                        let b_edge_orbit = self.puzzle.edge_orbit(b_edge);
-                        if a_piece_edge > b_piece_edge && a_edge_orbit == b_edge_orbit {
-                            // loop over all possible destination edges including parity for which side a_piece_dest is on
-                            let dest_adj = EdgeKey::iter(self.puzzle.num_edges())
-                                .filter(|dest_edge| {
-                                    self.puzzle.edge_orbit(*dest_edge) == a_edge_orbit
-                                })
-                                .map(|dest_edge| self.puzzle.edge_pieces(dest_edge))
-                                .flat_map(|[a_dest, b_dest]| [[a_dest, b_dest], [b_dest, a_dest]])
-                                .filter(|[a_dest, b_dest]| {
-                                    self.puzzle.piece_orbit(a_dest.piece) == a_orbit
-                                        && self.puzzle.piece_orbit(b_dest.piece) == b_orbit
-                                })
-                                // `and` the required vars for a_piece_edge and b_piece_edge to be adjacent at dest_edge
-                                .filter_map(|[a_dest, b_dest]| {
-                                    Some([
-                                        self.piece_dest_vars.get(a_piece, a_dest.piece).unwrap(),
-                                        self.piece_dest_rot_vars
-                                            .get(
-                                                a_piece,
-                                                rotation_from_edge(
-                                                    a_info,
-                                                    a_piece_edge.edge,
-                                                    a_dest.edge,
-                                                )?,
-                                            )
-                                            .unwrap(),
-                                        self.piece_dest_vars.get(b_piece, b_dest.piece).unwrap(),
-                                        self.piece_dest_rot_vars
-                                            .get(
-                                                b_piece,
-                                                rotation_from_edge(
-                                                    b_info,
-                                                    b_piece_edge.edge,
-                                                    b_dest.edge,
-                                                )?,
-                                            )
-                                            .unwrap(),
-                                    ])
-                                })
-                                .map(|vars| self.sat.and_var(&vars))
-                                .collect_vec();
-
-                            // `or` over all possibilities for a_piece_edge and b_piece_edge to be adjacent
-                            self.piece_dest_adjacent_vars.put(
-                                a_piece_edge,
-                                b_piece_edge,
-                                self.sat.or_var(&dest_adj),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn add_piece_dest_adjacent_not_same(&mut self) {
-        for edge in EdgeKey::iter(self.puzzle.num_edges()) {
-            let [a, b] = self.puzzle.edge_pieces(edge);
-            self.sat
-                .not_clause(self.piece_dest_adjacent_vars.get(a, b).unwrap());
-        }
-    }
-
-    fn add_piece_dest_adjacent_to_matching(&mut self) {
-        for edge_a in EdgeKey::iter(self.puzzle.num_edges()) {
-            let [piece_a1, piece_a2] = self.puzzle.edge_pieces(edge_a);
-
-            for edge_b in EdgeKey::iter(edge_a.0) {
-                if let Some(edge_matches) = self.edge_matching_vars.get(edge_a, edge_b) {
-                    let [piece_b1, piece_b2] = self.puzzle.edge_pieces(edge_b);
-
-                    // edges match implies destination pieces trade neighbors
-                    let case_1 = self.sat.and_var(&[
-                        self.piece_dest_adjacent_vars
-                            .get(piece_a1, piece_b1)
-                            .unwrap(),
-                        self.piece_dest_adjacent_vars
-                            .get(piece_a2, piece_b2)
-                            .unwrap(),
-                    ]);
-                    let case_2 = self.sat.and_var(&[
-                        self.piece_dest_adjacent_vars
-                            .get(piece_a1, piece_b2)
-                            .unwrap(),
-                        self.piece_dest_adjacent_vars
-                            .get(piece_a2, piece_b1)
-                            .unwrap(),
-                    ]);
-                    let dest_matches = self.sat.or_var(&[case_1, case_2]);
-                    self.sat.implies_clause(edge_matches, dest_matches);
-                }
-            }
-        }
+        println!(
+            "edge matching: {}",
+            puzzle_edge_pairs(&self.puzzle)
+                .filter(|&(edge_a, edge_b)| {
+                    self.edge_matching_vars
+                        .get(edge_a, edge_b)
+                        .map(|var| solution.get(var))
+                        .unwrap_or(false)
+                })
+                .map(|(edge_a, edge_b)| (edge_b, edge_a)) // flip order to have smaller edge first
+                .sorted()
+                .map(|(edge_a, edge_b)| format!(
+                    "{}={}",
+                    self.puzzle.format_edge(edge_a),
+                    self.puzzle.format_edge(edge_b)
+                ))
+                .format(" ")
+        );
     }
 
     fn add_prior_solution(&mut self, solution: &SatSolution) {
-        for symmetry in SymmetryKey::iter(self.puzzle.num_global_symmetries()) {
-            let puzzle = &self.puzzle;
-            let edge_matching_vars = &self.edge_matching_vars;
-            let differ_vars = EdgeKey::iter(puzzle.num_edges())
-                .flat_map(|a| EdgeKey::iter(a.0).map(move |b| (a, b)))
-                .filter_map(|(a, b)| {
-                    let matches = solution.get(edge_matching_vars.get(a, b)?);
-                    let a = puzzle.edge_global_symmetry(a, symmetry);
-                    let b = puzzle.edge_global_symmetry(b, symmetry);
-                    let v = edge_matching_vars.get(a, b).unwrap();
-                    if matches {
-                        Some(!v)
-                    } else {
-                        Some(v)
-                    }
-                })
-                .collect_vec();
-            self.sat.or_clause(&differ_vars);
-        }
+        let point_dest_vars = &self.point_dest_vars;
+        let differ_vars = puzzle_pieces(&self.puzzle)
+            .map(|src_piece| self.puzzle.arbitrary_point_on_piece(src_piece))
+            .flat_map(|src_point| {
+                puzzle_points(&self.puzzle)
+                    .filter_map(move |dest_point| point_dest_vars.get(src_point, dest_point))
+            })
+            .map(|var| if solution.get(var) { !var } else { var })
+            .collect_vec();
+        self.sat.or_clause(&differ_vars);
     }
 }

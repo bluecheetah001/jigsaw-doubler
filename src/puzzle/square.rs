@@ -1,7 +1,4 @@
-use super::{
-    EdgeKey, EdgeOrbitKey, PieceKey, PieceKeyEdge, PieceOrbitInfo, PieceOrbitKey, Puzzle,
-    SymmetryKey,
-};
+use super::{EdgeKey, PieceKey, PointKey, Puzzle};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PieceLoc {
@@ -14,7 +11,7 @@ impl PieceLoc {
     }
     fn up_edge(&self) -> EdgeLoc {
         EdgeLoc {
-            loc: PieceLoc {
+            piece: PieceLoc {
                 row: self.row - 1,
                 col: self.col,
             },
@@ -23,19 +20,19 @@ impl PieceLoc {
     }
     fn right_edge(&self) -> EdgeLoc {
         EdgeLoc {
-            loc: *self,
+            piece: *self,
             side: EdgeSide::Right,
         }
     }
     fn down_edge(&self) -> EdgeLoc {
         EdgeLoc {
-            loc: *self,
+            piece: *self,
             side: EdgeSide::Down,
         }
     }
     fn left_edge(&self) -> EdgeLoc {
         EdgeLoc {
-            loc: PieceLoc {
+            piece: PieceLoc {
                 row: self.row,
                 col: self.col - 1,
             },
@@ -70,20 +67,73 @@ impl PieceLoc {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PointLoc {
+    piece: PieceLoc,
+    side: PointSide,
+}
+impl PointLoc {
+    fn new(piece: PieceLoc, side: PointSide) -> Self {
+        Self { piece, side }
+    }
+    fn new_up(row: usize, col: usize) -> Self {
+        Self {
+            piece: PieceLoc::new(row, col),
+            side: PointSide::Up,
+        }
+    }
+    fn new_right(row: usize, col: usize) -> Self {
+        Self {
+            piece: PieceLoc::new(row, col),
+            side: PointSide::Right,
+        }
+    }
+    fn new_down(row: usize, col: usize) -> Self {
+        Self {
+            piece: PieceLoc::new(row, col),
+            side: PointSide::Down,
+        }
+    }
+    fn new_left(row: usize, col: usize) -> Self {
+        Self {
+            piece: PieceLoc::new(row, col),
+            side: PointSide::Left,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointSide {
+    Up,
+    Right,
+    Down,
+    Left,
+}
+enum PieceLocationKind {
+    UpLeft,
+    Up,
+    UpRight,
+    Left,
+    Center,
+    Right,
+    DownLeft,
+    Down,
+    DownRight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EdgeLoc {
-    loc: PieceLoc,
+    piece: PieceLoc,
     side: EdgeSide,
 }
 impl EdgeLoc {
     fn new_right(row: usize, col: usize) -> Self {
         Self {
-            loc: PieceLoc::new(row, col),
+            piece: PieceLoc::new(row, col),
             side: EdgeSide::Right,
         }
     }
     fn new_down(row: usize, col: usize) -> Self {
         Self {
-            loc: PieceLoc::new(row, col),
+            piece: PieceLoc::new(row, col),
             side: EdgeSide::Down,
         }
     }
@@ -123,22 +173,53 @@ impl SquarePuzzle {
         self.rows - 1
     }
 
-    fn implicit_rotation(&self, piece: PieceLoc) -> usize {
+    fn piece_location_kind(&self, piece: PieceLoc) -> PieceLocationKind {
         match (
             piece.row == 0,
             piece.row == self.last_row(),
             piece.col == 0,
             piece.col == self.last_col(),
         ) {
-            (false, false, false, false) => 0, // center
-            (true, false, false, false) => 1,  // up
-            (false, true, false, false) => 3,  // down
-            (false, false, true, false) => 0,  // left
-            (false, false, false, true) => 2,  // right
-            (true, false, true, false) => 1,   // up left
-            (true, false, false, true) => 2,   // up right
-            (false, true, true, false) => 0,   // down left
-            (false, true, false, true) => 3,   // down right
+            (false, false, false, false) => PieceLocationKind::Center,
+            (true, false, false, false) => PieceLocationKind::Up,
+            (false, true, false, false) => PieceLocationKind::Down,
+            (false, false, true, false) => PieceLocationKind::Left,
+            (false, false, false, true) => PieceLocationKind::Right,
+            (true, false, true, false) => PieceLocationKind::UpLeft,
+            (true, false, false, true) => PieceLocationKind::UpRight,
+            (false, true, true, false) => PieceLocationKind::DownLeft,
+            (false, true, false, true) => PieceLocationKind::DownRight,
+            _ => unreachable!(),
+        }
+    }
+    fn point_orbit(&self, point: PointLoc) -> u32 {
+        match (self.piece_location_kind(point.piece), point.side) {
+            // up left corner is isolated to break rotational symmetry
+            (PieceLocationKind::UpLeft, PointSide::Right) => 0,
+            (PieceLocationKind::UpLeft, PointSide::Down) => 1,
+            // corner
+            (PieceLocationKind::UpRight, PointSide::Down) => 2,
+            (PieceLocationKind::UpRight, PointSide::Left) => 3,
+            (PieceLocationKind::DownRight, PointSide::Left) => 2,
+            (PieceLocationKind::DownRight, PointSide::Up) => 3,
+            (PieceLocationKind::DownLeft, PointSide::Up) => 2,
+            (PieceLocationKind::DownLeft, PointSide::Right) => 3,
+            // edge
+            (PieceLocationKind::Up, PointSide::Right) => 4,
+            (PieceLocationKind::Up, PointSide::Down) => 5,
+            (PieceLocationKind::Up, PointSide::Left) => 6,
+            (PieceLocationKind::Right, PointSide::Down) => 4,
+            (PieceLocationKind::Right, PointSide::Left) => 5,
+            (PieceLocationKind::Right, PointSide::Up) => 6,
+            (PieceLocationKind::Down, PointSide::Left) => 4,
+            (PieceLocationKind::Down, PointSide::Up) => 5,
+            (PieceLocationKind::Down, PointSide::Right) => 6,
+            (PieceLocationKind::Left, PointSide::Up) => 4,
+            (PieceLocationKind::Left, PointSide::Right) => 5,
+            (PieceLocationKind::Left, PointSide::Down) => 6,
+            // center
+            (PieceLocationKind::Center, _) => 7,
+
             _ => unreachable!(),
         }
     }
@@ -149,10 +230,47 @@ impl SquarePuzzle {
         let col = piece.0 % self.cols;
         PieceLoc::new(row, col)
     }
-    fn piece_key_edge(&self, piece: PieceLoc, edge: usize) -> PieceKeyEdge {
-        let edge = (edge + 4 - self.implicit_rotation(piece)) % 4;
-        let piece = PieceKey(self.cols * piece.row + piece.col);
-        PieceKeyEdge::new(piece, edge)
+    fn piece_key(&self, piece: PieceLoc) -> PieceKey {
+        PieceKey(self.cols * piece.row + piece.col)
+    }
+    fn point_loc(&self, point: PointKey) -> PointLoc {
+        let mut index = point.0;
+        assert!(index < self.num_points());
+        let first: bool = index & 1 == 0;
+        index >>= 1;
+        if index < self.num_vert_edges() {
+            let row = index / (self.cols - 1);
+            let col = index % (self.cols - 1);
+            if first {
+                PointLoc::new_right(row, col)
+            } else {
+                PointLoc::new_left(row, col + 1)
+            }
+        } else {
+            index -= self.num_vert_edges();
+            let row = index / self.cols;
+            let col = index % self.cols;
+            if first {
+                PointLoc::new_down(row, col)
+            } else {
+                PointLoc::new_up(row + 1, col)
+            }
+        }
+    }
+    fn point_key(&self, point: PointLoc) -> PointKey {
+        match point.side {
+            PointSide::Right => PointKey((point.piece.row * (self.cols - 1) + point.piece.col) * 2),
+            PointSide::Left => {
+                PointKey((point.piece.row * (self.cols - 1) + (point.piece.col - 1)) * 2 + 1)
+            }
+            PointSide::Down => PointKey(
+                (self.num_vert_edges() + point.piece.row * self.cols + point.piece.col) * 2,
+            ),
+            PointSide::Up => PointKey(
+                (self.num_vert_edges() + (point.piece.row - 1) * self.cols + point.piece.col) * 2
+                    + 1,
+            ),
+        }
     }
     fn edge_loc(&self, edge: EdgeKey) -> EdgeLoc {
         assert!(edge.0 < self.num_edges());
@@ -168,32 +286,10 @@ impl SquarePuzzle {
     }
     fn edge_key(&self, edge: EdgeLoc) -> EdgeKey {
         match edge.side {
-            EdgeSide::Right => EdgeKey(edge.loc.row * (self.cols - 1) + edge.loc.col),
+            EdgeSide::Right => EdgeKey(edge.piece.row * (self.cols - 1) + edge.piece.col),
             EdgeSide::Down => {
-                EdgeKey(self.num_vert_edges() + edge.loc.row * self.cols + edge.loc.col)
+                EdgeKey(self.num_vert_edges() + edge.piece.row * self.cols + edge.piece.col)
             }
-        }
-    }
-
-    fn global_reflect_vert_edge(&self, edge: EdgeLoc) -> EdgeLoc {
-        match edge.side {
-            EdgeSide::Right => EdgeLoc::new_right(self.last_row() - edge.loc.row, edge.loc.col),
-            EdgeSide::Down => EdgeLoc::new_down(self.last_row() - 1 - edge.loc.row, edge.loc.col),
-        }
-    }
-    fn global_reflect_horiz_edge(&self, edge: EdgeLoc) -> EdgeLoc {
-        match edge.side {
-            EdgeSide::Right => EdgeLoc::new_right(edge.loc.row, self.last_col() - 1 - edge.loc.col),
-            EdgeSide::Down => EdgeLoc::new_down(edge.loc.row, self.last_col() - edge.loc.col),
-        }
-    }
-    fn global_rotate_90_edge(&self, edge: EdgeLoc) -> EdgeLoc {
-        // self.rows is known to equal self.cols if we get here
-        debug_assert_eq!(self.rows, self.cols);
-        let side_max = self.last_row();
-        match edge.side {
-            EdgeSide::Right => EdgeLoc::new_down(edge.loc.col, side_max - edge.loc.row),
-            EdgeSide::Down => EdgeLoc::new_right(edge.loc.col, side_max - 1 - edge.loc.row),
         }
     }
 }
@@ -201,105 +297,129 @@ impl Puzzle for SquarePuzzle {
     fn num_pieces(&self) -> usize {
         self.rows * self.cols
     }
-
-    fn piece_orbit(&self, piece: PieceKey) -> PieceOrbitKey {
-        if piece == PieceKey(0) {
-            // ul corner is given a dedicated orbit to break rotational symmetry of the puzzle
-            return PieceOrbitKey(0);
-        }
-        let piece = self.piece_loc(piece);
-        let inner_row = piece.row > 0 && piece.row < self.last_row();
-        let inner_col = piece.col > 0 && piece.col < self.last_col();
-        PieceOrbitKey(1 + inner_row as usize + inner_col as usize)
-    }
-
-    fn piece_orbit_info(&self, orbit: PieceOrbitKey) -> PieceOrbitInfo {
-        match orbit.0 {
-            // corners
-            0 | 1 => PieceOrbitInfo {
-                rotations: 1,
-                edges: 2,
-                edge_increment_per_rotation: 2,
-            },
-            // edges
-            2 => PieceOrbitInfo {
-                rotations: 1,
-                edges: 3,
-                edge_increment_per_rotation: 3,
-            },
-            // centers
-            3 => PieceOrbitInfo {
-                rotations: 4,
-                edges: 4,
-                edge_increment_per_rotation: 1,
-            },
-            _ => panic!("invalid piece orbit"),
-        }
-    }
-
     fn num_edges(&self) -> usize {
         self.num_vert_edges() + self.num_horz_edges()
     }
 
-    fn edge_orbit(&self, edge: EdgeKey) -> EdgeOrbitKey {
-        let edge = self.edge_loc(edge);
-        let inner = match edge.side {
-            EdgeSide::Right => edge.loc.row > 0 && edge.loc.row < self.last_row(),
-            EdgeSide::Down => edge.loc.col > 0 && edge.loc.col < self.last_col(),
+    fn arbitrary_point_on_piece(&self, piece: PieceKey) -> PointKey {
+        let piece = self.piece_loc(piece);
+        let side = if piece.row == 0 {
+            PointSide::Down
+        } else {
+            PointSide::Up
         };
-        EdgeOrbitKey(inner as usize)
+        self.point_key(PointLoc::new(piece, side))
     }
+    fn next_point_on_piece(&self, point: PointKey) -> PointKey {
+        let point = self.point_loc(point);
+        let next_side = match (self.piece_location_kind(point.piece), point.side) {
+            // corner
+            (PieceLocationKind::UpLeft, PointSide::Right) => PointSide::Down,
+            (PieceLocationKind::UpLeft, PointSide::Down) => PointSide::Right,
+            (PieceLocationKind::UpRight, PointSide::Down) => PointSide::Left,
+            (PieceLocationKind::UpRight, PointSide::Left) => PointSide::Down,
+            (PieceLocationKind::DownRight, PointSide::Left) => PointSide::Up,
+            (PieceLocationKind::DownRight, PointSide::Up) => PointSide::Left,
+            (PieceLocationKind::DownLeft, PointSide::Up) => PointSide::Right,
+            (PieceLocationKind::DownLeft, PointSide::Right) => PointSide::Up,
+            // edge
+            (PieceLocationKind::Up, PointSide::Right) => PointSide::Down,
+            (PieceLocationKind::Up, PointSide::Down) => PointSide::Left,
+            (PieceLocationKind::Up, PointSide::Left) => PointSide::Right,
+            (PieceLocationKind::Right, PointSide::Down) => PointSide::Left,
+            (PieceLocationKind::Right, PointSide::Left) => PointSide::Up,
+            (PieceLocationKind::Right, PointSide::Up) => PointSide::Down,
+            (PieceLocationKind::Down, PointSide::Left) => PointSide::Up,
+            (PieceLocationKind::Down, PointSide::Up) => PointSide::Right,
+            (PieceLocationKind::Down, PointSide::Right) => PointSide::Left,
+            (PieceLocationKind::Left, PointSide::Up) => PointSide::Right,
+            (PieceLocationKind::Left, PointSide::Right) => PointSide::Down,
+            (PieceLocationKind::Left, PointSide::Down) => PointSide::Up,
+            // center
+            (PieceLocationKind::Center, PointSide::Up) => PointSide::Right,
+            (PieceLocationKind::Center, PointSide::Right) => PointSide::Down,
+            (PieceLocationKind::Center, PointSide::Down) => PointSide::Left,
+            (PieceLocationKind::Center, PointSide::Left) => PointSide::Up,
 
-    fn piece_edge(&self, piece_edge: PieceKeyEdge) -> EdgeKey {
-        let loc = self.piece_loc(piece_edge.piece);
-        let edge = (piece_edge.edge + self.implicit_rotation(loc)) % 4;
-        let edge_loc = match edge {
-            0 => loc.up_edge(),
-            1 => loc.right_edge(),
-            2 => loc.down_edge(),
-            3 => loc.left_edge(),
             _ => unreachable!(),
         };
-        self.edge_key(edge_loc)
+        self.point_key(PointLoc::new(point.piece, next_side))
+    }
+    fn point_piece(&self, point: PointKey) -> PieceKey {
+        self.piece_key(self.point_loc(point).piece)
     }
 
-    fn edge_pieces(&self, edge: EdgeKey) -> [PieceKeyEdge; 2] {
-        let edge_loc = self.edge_loc(edge);
-        match edge_loc.side {
-            EdgeSide::Right => [
-                self.piece_key_edge(edge_loc.loc, 1),
-                self.piece_key_edge(edge_loc.loc.right_piece(), 3),
-            ],
-            EdgeSide::Down => [
-                self.piece_key_edge(edge_loc.loc, 2),
-                self.piece_key_edge(edge_loc.loc.down_piece(), 0),
-            ],
-        }
+    fn arbitrary_point_on_edge(&self, edge: EdgeKey) -> PointKey {
+        let edge = self.edge_loc(edge);
+        let side = match edge.side {
+            EdgeSide::Right => PointSide::Right,
+            EdgeSide::Down => PointSide::Down,
+        };
+        self.point_key(PointLoc::new(edge.piece, side))
+    }
+    fn other_point_on_edge(&self, point: PointKey) -> PointKey {
+        let point = self.point_loc(point);
+        let other_point = match point.side {
+            PointSide::Up => PointLoc::new_down(point.piece.row - 1, point.piece.col),
+            PointSide::Right => PointLoc::new_left(point.piece.row, point.piece.col + 1),
+            PointSide::Down => PointLoc::new_up(point.piece.row + 1, point.piece.col),
+            PointSide::Left => PointLoc::new_right(point.piece.row, point.piece.col - 1),
+        };
+        self.point_key(other_point)
+    }
+    fn point_edge(&self, point: PointKey) -> EdgeKey {
+        let point = self.point_loc(point);
+        let edge = match point.side {
+            PointSide::Up => EdgeLoc::new_down(point.piece.row - 1, point.piece.col),
+            PointSide::Right => EdgeLoc::new_right(point.piece.row, point.piece.col),
+            PointSide::Down => EdgeLoc::new_down(point.piece.row, point.piece.col),
+            PointSide::Left => EdgeLoc::new_right(point.piece.row, point.piece.col - 1),
+        };
+        self.edge_key(edge)
     }
 
-    fn num_global_symmetries(&self) -> usize {
-        if self.rows == self.cols {
-            8
-        } else {
-            4
-        }
+    fn can_exchange(&self, point_a: PointKey, point_b: PointKey) -> bool {
+        let point_a = self.point_loc(point_a);
+        let point_b = self.point_loc(point_b);
+        self.point_orbit(point_a) == self.point_orbit(point_b)
     }
 
-    fn edge_global_symmetry(&self, edge: EdgeKey, symmetry: SymmetryKey) -> EdgeKey {
-        assert!(symmetry.0 < self.num_global_symmetries());
-        let mut edge_loc = self.edge_loc(edge);
-        // decompose symmetries as vertical reflection, horizontal reflection, and 90 rotation
-        if symmetry.0 & 1 == 1 {
-            edge_loc = self.global_reflect_vert_edge(edge_loc);
-        }
-        if symmetry.0 & 2 == 2 {
-            edge_loc = self.global_reflect_horiz_edge(edge_loc);
-        }
-        if symmetry.0 & 4 == 4 {
-            edge_loc = self.global_rotate_90_edge(edge_loc);
-        }
-        self.edge_key(edge_loc)
+    fn format_edge(&self, edge: EdgeKey) -> String {
+        let edge = self.edge_loc(edge);
+        let side_char = match edge.side {
+            EdgeSide::Right => '|',
+            EdgeSide::Down => '_',
+        };
+        format!(
+            "{}{}{}",
+            row_char(edge.piece.row),
+            col_char(edge.piece.col),
+            side_char
+        )
     }
+    fn format_point(&self, point: PointKey) -> String {
+        let point = self.point_loc(point);
+        let side_char = match point.side {
+            PointSide::Up => '^',
+            PointSide::Right => '>',
+            PointSide::Down => 'v',
+            PointSide::Left => '<',
+        };
+        format!(
+            "{}{}{}",
+            row_char(point.piece.row),
+            col_char(point.piece.col),
+            side_char
+        )
+    }
+}
+fn row_char(row: usize) -> char {
+    assert!(row < 26);
+    ('a' as u8 + row as u8) as char
+}
+fn col_char(col: usize) -> char {
+    assert!(col < 9);
+    ('1' as u8 + col as u8) as char
 }
 
 // TODO tests!
