@@ -9,9 +9,13 @@ use puzzle::*;
 use sat::*;
 use varisat::Lit;
 
+fn make_puzzle() -> impl Puzzle {
+    SquarePuzzle::new(5, 5)
+}
+
 fn main() {
     let start_time = Instant::now();
-    let puzzle = SquarePuzzle::new(5, 5);
+    let puzzle = make_puzzle();
     JigsawDoubler::run(puzzle, start_time);
 }
 
