@@ -2,6 +2,9 @@
 name = "jigsaw-doubler"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+authors = ["Blue Cheetah"]
+repository = "https://github.com/bluecheetah001/jigsaw-doubler"
 
 [dependencies]
 humantime = "2.1.0"
